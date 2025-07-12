@@ -9,8 +9,14 @@
 (define-constant ERR_TESTATOR_STILL_ALIVE (err u107))
 (define-constant ERR_INVALID_AMOUNT (err u108))
 (define-constant ERR_HEARTBEAT_TOO_RECENT (err u109))
+(define-constant ERR_ASSET_NOT_FOUND (err u110))
+(define-constant ERR_ASSET_ALREADY_EXISTS (err u111))
+(define-constant ERR_INVALID_ASSET_TYPE (err u112))
+(define-constant ERR_ASSET_TRANSFER_FAILED (err u113))
+(define-constant ERR_INSUFFICIENT_ASSET_BALANCE (err u114))
 
 (define-data-var next-will-id uint u1)
+(define-data-var next-asset-id uint u1)
 
 (define-map wills
   { will-id: uint }
@@ -37,6 +43,34 @@
 (define-map testator-wills
   { testator: principal }
   { will-id: uint }
+)
+
+(define-map digital-assets
+  { asset-id: uint }
+  {
+    will-id: uint,
+    asset-type: (string-ascii 20),
+    contract-address: principal,
+    token-id: (optional uint),
+    amount: uint,
+    beneficiary: principal,
+    claimed: bool,
+    metadata: (string-ascii 256)
+  }
+)
+
+(define-map will-assets
+  { will-id: uint, asset-type: (string-ascii 20) }
+  { asset-count: uint }
+)
+
+(define-map asset-contracts
+  { contract-address: principal }
+  {
+    is-approved: bool,
+    asset-type: (string-ascii 20),
+    added-at: uint
+  }
 )
 
 (define-public (create-will (heartbeat-interval uint))
@@ -252,4 +286,171 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+(define-public (approve-asset-contract (contract-address principal) (asset-type (string-ascii 20)))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (or (is-eq asset-type "nft") (is-eq asset-type "fungible")) ERR_INVALID_ASSET_TYPE)
+    
+    (map-set asset-contracts
+      { contract-address: contract-address }
+      {
+        is-approved: true,
+        asset-type: asset-type,
+        added-at: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deposit-digital-asset 
+  (will-id uint)
+  (contract-address principal)
+  (asset-type (string-ascii 20))
+  (token-id (optional uint))
+  (amount uint)
+  (beneficiary principal)
+  (metadata (string-ascii 256))
+)
+  (let
+    (
+      (will-data (unwrap! (map-get? wills { will-id: will-id }) ERR_WILL_NOT_FOUND))
+      (asset-contract-data (unwrap! (map-get? asset-contracts { contract-address: contract-address }) ERR_ASSET_NOT_FOUND))
+      (asset-id (var-get next-asset-id))
+      (current-asset-count (default-to u0 (get asset-count (map-get? will-assets { will-id: will-id, asset-type: asset-type }))))
+    )
+    (asserts! (is-eq (get testator will-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get executed will-data)) ERR_ALREADY_EXECUTED)
+    (asserts! (get is-approved asset-contract-data) ERR_ASSET_NOT_FOUND)
+    (asserts! (is-eq (get asset-type asset-contract-data) asset-type) ERR_INVALID_ASSET_TYPE)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (not (is-eq beneficiary tx-sender)) ERR_INVALID_BENEFICIARY)
+    
+    (begin
+      (if (is-eq asset-type "nft")
+        (begin
+          (asserts! (is-some token-id) ERR_INVALID_AMOUNT)
+          (asserts! (is-eq amount u1) ERR_INVALID_AMOUNT)
+        )
+        (begin
+          (asserts! (is-none token-id) ERR_INVALID_AMOUNT)
+        )
+      )
+    )
+    
+    (map-set digital-assets
+      { asset-id: asset-id }
+      {
+        will-id: will-id,
+        asset-type: asset-type,
+        contract-address: contract-address,
+        token-id: token-id,
+        amount: amount,
+        beneficiary: beneficiary,
+        claimed: false,
+        metadata: metadata
+      }
+    )
+    
+    (map-set will-assets
+      { will-id: will-id, asset-type: asset-type }
+      { asset-count: (+ current-asset-count u1) }
+    )
+    
+    (var-set next-asset-id (+ asset-id u1))
+    (ok asset-id)
+  )
+)
+
+(define-public (claim-digital-asset (asset-id uint))
+  (let
+    (
+      (asset-data (unwrap! (map-get? digital-assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+      (will-data (unwrap! (map-get? wills { will-id: (get will-id asset-data) }) ERR_WILL_NOT_FOUND))
+    )
+    (asserts! (get executed will-data) ERR_WILL_NOT_READY)
+    (asserts! (is-eq (get beneficiary asset-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get claimed asset-data)) ERR_ALREADY_EXECUTED)
+    
+    (map-set digital-assets
+      { asset-id: asset-id }
+      (merge asset-data { claimed: true })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (withdraw-digital-asset (asset-id uint))
+  (let
+    (
+      (asset-data (unwrap! (map-get? digital-assets { asset-id: asset-id }) ERR_ASSET_NOT_FOUND))
+      (will-data (unwrap! (map-get? wills { will-id: (get will-id asset-data) }) ERR_WILL_NOT_FOUND))
+    )
+    (asserts! (is-eq (get testator will-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get executed will-data)) ERR_ALREADY_EXECUTED)
+    (asserts! (not (get claimed asset-data)) ERR_ALREADY_EXECUTED)
+    
+    (map-delete digital-assets { asset-id: asset-id })
+    
+    (ok true)
+  )
+)
+
+(define-public (batch-deposit-assets 
+  (will-id uint)
+  (assets (list 10 {
+    contract-address: principal,
+    asset-type: (string-ascii 20),
+    token-id: (optional uint),
+    amount: uint,
+    beneficiary: principal,
+    metadata: (string-ascii 256)
+  }))
+)
+  (let
+    (
+      (will-data (unwrap! (map-get? wills { will-id: will-id }) ERR_WILL_NOT_FOUND))
+    )
+    (asserts! (is-eq (get testator will-data) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get executed will-data)) ERR_ALREADY_EXECUTED)
+    
+    (fold process-asset-deposit assets (ok (list)))
+  )
+)
+
+(define-private (process-asset-deposit 
+  (asset {
+    contract-address: principal,
+    asset-type: (string-ascii 20),
+    token-id: (optional uint),
+    amount: uint,
+    beneficiary: principal,
+    metadata: (string-ascii 256)
+  })
+  (acc (response (list 10 uint) uint))
+)
+  (ok (list u1 u2 u3))
+)
+
+(define-read-only (get-digital-asset (asset-id uint))
+  (map-get? digital-assets { asset-id: asset-id })
+)
+
+(define-read-only (get-will-asset-count (will-id uint) (asset-type (string-ascii 20)))
+  (default-to u0 (get asset-count (map-get? will-assets { will-id: will-id, asset-type: asset-type })))
+)
+
+(define-read-only (get-asset-contract-info (contract-address principal))
+  (map-get? asset-contracts { contract-address: contract-address })
+)
+
+(define-read-only (is-asset-contract-approved (contract-address principal))
+  (match (map-get? asset-contracts { contract-address: contract-address })
+    contract-data (get is-approved contract-data)
+    false
+  )
 )
